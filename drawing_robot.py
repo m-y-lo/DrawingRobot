@@ -12,9 +12,8 @@ from typing import Iterable, Dict, List, Tuple, Optional
 ## GOAL: draw 5 strokes, switch colors
 ## TODO: will need to make sure all motor directions are correct once arm is assembled! (can change direction with a +/-1)
 
-
 # Ports and Joint IDs
-DEVICENAME = "COM3"                 # Win: "COMX" | macOS: "/dev/tty.usbserial-XXXX"
+DEVICENAME = "COM5"                 # Win: "COMX" | macOS: "/dev/tty.usbserial-XXXX"
                                     # check com port in device manager
 BAUDRATE   = 57600
 JOINT_IDS  = [1, 2, 3, 5]        
@@ -29,8 +28,8 @@ SOFT_LIMITS_DEG: List[Optional[Tuple[float, float]]] = [
 ]
 
 # Smooth
-PROFILE_ACCEL = 50
-PROFILE_VELOC = 80
+PROFILE_ACCEL = 40
+PROFILE_VELOC = 60
 
 # Control Table
 ADDR_TORQUE_ENABLE     = 64
@@ -45,7 +44,7 @@ TORQUE_ENABLE  = 1
 TORQUE_DISABLE = 0
 MODE_POSITION  = 3
 TICKS_MAX      = 4095
-TORQUE_LIMIT   = 512  # 50% of max torque (max is 1023)  
+TORQUE_LIMIT   = 765 # 75% of max torque (max is 1023)  
 
 # Constants
 PI = 3.1415926
@@ -53,8 +52,9 @@ GEAR_RATIO = 30/76      # from little gear to big gear on color switching end ef
 
 # Degree setup
 def _wrap_deg(d: float) -> float:
-    d = d % 360.0
+    # d = d % 360.0
     return d if d >= 0 else d + 360.0
+    # return d
 
 def deg_to_ticks(deg: float) -> int:
     return int(round(_wrap_deg(deg) / 360.0 * TICKS_MAX)) & TICKS_MAX
@@ -83,6 +83,7 @@ class Arm5DOF:
                 self.pkt.write4ByteTxRx(self.port, jid, ADDR_PROFILE_VELOCITY, int(PROFILE_VELOC))
             self.pkt.write2ByteTxRx(self.port, jid, ADDR_TORQUE_LIMIT, TORQUE_LIMIT)
             self.pkt.write1ByteTxRx(self.port, jid, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
+            
 
     def close(self):
         for jid in self.joint_ids:
@@ -93,13 +94,17 @@ class Arm5DOF:
         # if not 1 <= jn <= len(self.joint_ids):
         #     raise ValueError(f"joint number must be 1..{len(self.joint_ids)}")
         if jn == 5:
-            jn = 4
-        return self.joint_ids[jn - 1]
+            extra = 1
+        else:
+            extra = 0
+        return self.joint_ids[jn - 1 - extra]
 
     def _apply_model(self, jn: int, user_deg: float) -> float:
         if jn == 5:
-            jn = 4
-        i = jn - 1
+            extra = 1
+        else:
+            extra = 0
+        i = jn - 1 - extra
         return _wrap_deg(JOINT_SIGNS[i] * user_deg + JOINT_OFFSETS_DEG[i])
 
     def _inverse_model(self, jn: int, servo_deg: float) -> float:
@@ -111,8 +116,10 @@ class Arm5DOF:
 
     def _apply_limits(self, jn: int, user_deg: float) -> float:
         if jn == 5:
-            jn = 4
-        lim = SOFT_LIMITS_DEG[jn - 1]
+            extra = 1
+        else:
+            extra = 0
+        lim = SOFT_LIMITS_DEG[jn - 1 - extra]
         if lim is None:
             return user_deg
         lo, hi = lim
@@ -198,15 +205,23 @@ class Arm5DOF:
             servo_deg = self.get(jn)
             user0.append(self._inverse_model(jn, servo_deg))
 
-    def go_prismatic(self, vertical_amt, direction):
+    def read_angle(self):
+       ticks, comm, err = self.pkt.read4ByteTxRx(PortHandler("COM5"), 3, 132)
+       angle = ticks / 4095 * 360
+       print(angle)
+
+
+    def go_prismatic(self):
         """
         vertical_amt: the length (in mm) you want to move the prismatic joint
         direction: +1 = up
                    -1 = down
         """
-        diameter = 30 #mm
-        vert_deg = direction*360*(vertical_amt/(PI*diameter))
-        self.turn(jn = 1, degree = vert_deg)
+        # diameter = 30 #mm
+        # vert_deg = direction*360*(vertical_amt/(PI*diameter))
+        # self.turn(jn = 1, degree = vert_deg)
+        self.turn(jn = 1, degree = 100)
+        time.sleep(0.5)
 
 
     def go_to(self):
@@ -223,24 +238,25 @@ class Arm5DOF:
 
     def scribble(self):
         for i in range(5):
-            # self.turn(jn = 2, degree = -15)
-            self.turn(jn = 3, degree = -15)
+            self.turn(jn = 2, degree = -20)
+            self.turn(jn = 3, degree = 200)
             time.sleep(0.5)
-            # self.turn(jn = 2, degree = 15)
-            self.turn(jn = 3, degree = 15)
+            self.turn(jn = 2, degree = 20)
+            self.turn(jn = 3, degree = -210)
             time.sleep(0.5)
 
-    def move_a_litte(self):
-        self.turn(jn = 2, degree = -10)
-        self.turn(jn = 3, degree = -10)
-    
 
 
     def color_rotate(self):
         """ Move motor 5 to rotate end effector. (One color at a time)"""
-        color_switch = 90 
-        # self.turn(jn = 5, degree = color_switch/GEAR_RATIO)
-        self.turn(jn = 5, degree = 30)
+
+        self.turn(jn = 5, degree = 180)
+        time.sleep(0.5)
+        # self.turn(jn = 5, degree = 400)
+        # time.sleep(0.5)
+        # self.turn(jn = 5, degree = 120)
+        # self.turn(jn = 5, degree = -10)
+
 
     def draw_gradient(self):
         up_down_amt = 40
@@ -248,9 +264,9 @@ class Arm5DOF:
         self.start1()
 
         # self.go_to_start()
-        # self.go_prismatic(up_down_amt, 1)
-        # self.scribble()
-        self.color_rotate()
+        # self.go_prismatic()
+        self.scribble()
+        # self.color_rotate()
 
         # self.go_prismatic(up_down_amt, -1)
         # self.color_rotate()
@@ -280,6 +296,7 @@ if __name__ == "__main__":
     try:
         # arm.seq_same_delta_hold_then_return(delta_deg=30, dwell=0.6, settle=True)
         arm.draw_gradient()
+        # arm.read_angle()
 
     finally:
         arm.close()

@@ -14,10 +14,10 @@ from typing import Iterable, Dict, List, Tuple, Optional
 
 
 # Ports and Joint IDs
-DEVICENAME = "COM5"                 # Win: "COMX" | macOS: "/dev/tty.usbserial-XXXX"
+DEVICENAME = "COM3"                 # Win: "COMX" | macOS: "/dev/tty.usbserial-XXXX"
                                     # check com port in device manager
 BAUDRATE   = 57600
-JOINT_IDS  = [1, 2, 3, 5] #6]        
+JOINT_IDS  = [1, 2, 3, 5]        
 
 # Direction
 JOINT_OFFSETS_DEG = [0, 0, 0, 0]
@@ -30,7 +30,7 @@ SOFT_LIMITS_DEG: List[Optional[Tuple[float, float]]] = [
 
 # Smooth
 PROFILE_ACCEL = 50
-PROFILE_VELOC = 150
+PROFILE_VELOC = 80
 
 # Control Table
 ADDR_TORQUE_ENABLE     = 64
@@ -39,11 +39,13 @@ ADDR_GOAL_POSITION     = 116
 ADDR_PRESENT_POSITION  = 132
 ADDR_PROFILE_VELOCITY  = 112
 ADDR_PROFILE_ACCEL     = 108
+ADDR_TORQUE_LIMIT      = 102
 
 TORQUE_ENABLE  = 1
 TORQUE_DISABLE = 0
 MODE_POSITION  = 3
-TICKS_MAX      = 4095  
+TICKS_MAX      = 4095
+TORQUE_LIMIT   = 512  # 50% of max torque (max is 1023)  
 
 # Constants
 PI = 3.1415926
@@ -79,6 +81,7 @@ class Arm5DOF:
                 self.pkt.write4ByteTxRx(self.port, jid, ADDR_PROFILE_ACCEL, int(PROFILE_ACCEL))
             if PROFILE_VELOC is not None:
                 self.pkt.write4ByteTxRx(self.port, jid, ADDR_PROFILE_VELOCITY, int(PROFILE_VELOC))
+            self.pkt.write2ByteTxRx(self.port, jid, ADDR_TORQUE_LIMIT, TORQUE_LIMIT)
             self.pkt.write1ByteTxRx(self.port, jid, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
 
     def close(self):
@@ -87,11 +90,15 @@ class Arm5DOF:
         self.port.closePort()
 
     def _map_joint(self, jn: int) -> int:
-        if not 1 <= jn <= len(self.joint_ids):
-            raise ValueError(f"joint number must be 1..{len(self.joint_ids)}")
+        # if not 1 <= jn <= len(self.joint_ids):
+        #     raise ValueError(f"joint number must be 1..{len(self.joint_ids)}")
+        if jn == 5:
+            jn = 4
         return self.joint_ids[jn - 1]
 
     def _apply_model(self, jn: int, user_deg: float) -> float:
+        if jn == 5:
+            jn = 4
         i = jn - 1
         return _wrap_deg(JOINT_SIGNS[i] * user_deg + JOINT_OFFSETS_DEG[i])
 
@@ -103,6 +110,8 @@ class Arm5DOF:
         return _wrap_deg(val)
 
     def _apply_limits(self, jn: int, user_deg: float) -> float:
+        if jn == 5:
+            jn = 4
         lim = SOFT_LIMITS_DEG[jn - 1]
         if lim is None:
             return user_deg
@@ -183,6 +192,12 @@ class Arm5DOF:
 
         self.turns(user0, wait=True)
 
+    def start1(self):
+        user0 = []
+        for jn in range(1, len(self.joint_ids)+1):
+            servo_deg = self.get(jn)
+            user0.append(self._inverse_model(jn, servo_deg))
+
     def go_prismatic(self, vertical_amt, direction):
         """
         vertical_amt: the length (in mm) you want to move the prismatic joint
@@ -208,8 +223,12 @@ class Arm5DOF:
 
     def scribble(self):
         for i in range(5):
-            self.turn(jn = 2, degree = -30)
-            self.turn(jn = 2, degree = 30)
+            # self.turn(jn = 2, degree = -15)
+            self.turn(jn = 3, degree = -15)
+            time.sleep(0.5)
+            # self.turn(jn = 2, degree = 15)
+            self.turn(jn = 3, degree = 15)
+            time.sleep(0.5)
 
     def move_a_litte(self):
         self.turn(jn = 2, degree = -10)
@@ -217,37 +236,41 @@ class Arm5DOF:
     
 
 
-    def color_rotate(self, num_switches):
-        """ Move motor 4 to rotate end effector. (One color at a time)"""
+    def color_rotate(self):
+        """ Move motor 5 to rotate end effector. (One color at a time)"""
         color_switch = 90 
-        self.turn(jn = 4, degree = color_switch/GEAR_RATIO)
+        # self.turn(jn = 5, degree = color_switch/GEAR_RATIO)
+        self.turn(jn = 5, degree = 30)
 
     def draw_gradient(self):
-        up_down_amt = 10
+        up_down_amt = 40
 
-        self.go_to_start()
-        self.go_prismatic(up_down_amt, -1)
-        self.scribble()
+        self.start1()
 
-        self.go_prismatic(up_down_amt, 1)
-        self.color_rotate(self, 1)
-        self.move_a_litte()
-        self.go_prismatic(up_down_amt, -1)
-        self.scribble()
+        # self.go_to_start()
+        # self.go_prismatic(up_down_amt, 1)
+        # self.scribble()
+        self.color_rotate()
 
-        self.go_prismatic(up_down_amt, 1)
-        self.color_rotate(self, 1)
-        self.move_a_litte()
-        self.go_prismatic(up_down_amt, -1)
-        self.scribble()
+        # self.go_prismatic(up_down_amt, -1)
+        # self.color_rotate()
+        # self.move_a_litte()
+        # self.go_prismatic(up_down_amt, 1)
+        # self.scribble()
 
-        self.go_prismatic(up_down_amt, 1)
-        self.color_rotate(self, 1)
-        self.move_a_litte()
-        self.go_prismatic(up_down_amt, -1)
-        self.scribble()
+        # self.go_prismatic(up_down_amt, -1)
+        # self.color_rotate()
+        # self.move_a_litte()
+        # self.go_prismatic(up_down_amt, 1)
+        # self.scribble()
 
-        self.go_prismatic(up_down_amt, 1)
+        # self.go_prismatic(up_down_amt, -1)
+        # self.color_rotate()
+        # self.move_a_litte()
+        # self.go_prismatic(up_down_amt, 1)
+        # self.scribble()
+
+        # self.go_prismatic(up_down_amt, 1)
 
         
 
@@ -255,7 +278,7 @@ class Arm5DOF:
 if __name__ == "__main__":
     arm = Arm5DOF()
     try:
-        #arm.seq_same_delta_hold_then_return(delta_deg=30, dwell=0.6, settle=True)
+        # arm.seq_same_delta_hold_then_return(delta_deg=30, dwell=0.6, settle=True)
         arm.draw_gradient()
 
     finally:

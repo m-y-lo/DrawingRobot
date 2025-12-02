@@ -200,13 +200,22 @@ class Arm5DOF:
         this function should move motors 2/3 to move end effector to target position
         (put inverse kinematics here)
         """
-        temp = 1
 
-    def scribble():
-        """
-        TODO: implement this function
-        this function should move the arm back and forth in a scribbling motion 5 times
-        """
+    def go_to_start(self):
+        self.turn(jn = 2, degree = 30)
+        self.turn(jn = 3, degree = 30)
+
+
+    def scribble(self):
+        for i in range(5):
+            self.turn(jn = 2, degree = -30)
+            self.turn(jn = 2, degree = 30)
+
+    def move_a_litte(self):
+        self.turn(jn = 2, degree = -10)
+        self.turn(jn = 3, degree = -10)
+    
+
 
     def color_rotate(self, num_switches):
         """ Move motor 4 to rotate end effector. (One color at a time)"""
@@ -214,23 +223,32 @@ class Arm5DOF:
         self.turn(jn = 4, degree = color_switch/GEAR_RATIO)
 
     def draw_gradient(self):
-        self.go_to()
-        self.go_prismatic(5, -1)
+        up_down_amt = 10
+
+        self.go_to_start()
+        self.go_prismatic(up_down_amt, -1)
         self.scribble()
-        self.go_prismatic(5, 1)
+
+        self.go_prismatic(up_down_amt, 1)
         self.color_rotate(self, 1)
-        self.go_prismatic(5, -1)
+        self.move_a_litte()
+        self.go_prismatic(up_down_amt, -1)
         self.scribble()
-        self.go_prismatic(5, 1)
+
+        self.go_prismatic(up_down_amt, 1)
         self.color_rotate(self, 1)
-        self.go_prismatic(5, -1)
+        self.move_a_litte()
+        self.go_prismatic(up_down_amt, -1)
         self.scribble()
-        self.go_prismatic(5, 1)
+
+        self.go_prismatic(up_down_amt, 1)
         self.color_rotate(self, 1)
-        self.go_prismatic(5, -1)
+        self.move_a_litte()
+        self.go_prismatic(up_down_amt, -1)
         self.scribble()
-        self.go_prismatic(5, 1)
-        self.go_to()
+
+        self.go_prismatic(up_down_amt, 1)
+
         
 
     

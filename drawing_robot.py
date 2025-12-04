@@ -1,305 +1,485 @@
 from __future__ import annotations
-from dynamixel_sdk import *  # pip install dynamixel-sdk
+from dynamixel_sdk import *
 import time
-from typing import Iterable, Dict, List, Tuple, Optional
+from typing import Dict, Tuple
+import math
 
+###############################################
+# Protocol 2.0 version for MX-series (P-mode)
+###############################################
 
-## motor 1: prismatic
-## motor 2: first revolute
-## motor 3: second revolute
-## motor 5 (4): color switcher
+# Joint → Motor IDs
+JOINT_MAP = {
+    1: 1,   # prismatic
+    2: 2,   # revolute 1
+    3: 3,   # revolute 2
+    5: 5,   # color switcher
+}
 
-## GOAL: draw 5 strokes, switch colors
-## TODO: will need to make sure all motor directions are correct once arm is assembled! (can change direction with a +/-1)
+# sign & offset for each joint
+JOINT_SIGNS  = {1:+1, 2:+1, 3:+1, 5:+1}
+JOINT_OFFSET = {1:0,  2:0,  3:0,  5:0}
 
-# Ports and Joint IDs
-DEVICENAME = "COM5"                 # Win: "COMX" | macOS: "/dev/tty.usbserial-XXXX"
-                                    # check com port in device manager
+# Limits in degrees
+# Regulate joints 2,3,5 to 0-360. no regulation for prismatic joint
+LIMITS = {
+    1: (None, None),
+    2: (0, 360),
+    3: (0, 360),
+    5: (None, None),
+}
+
+###############################################
+# Port & Dynamixel Settings
+###############################################
+
+DEVICENAME = "COM13"
 BAUDRATE   = 57600
-JOINT_IDS  = [1, 2, 3, 5]        
 
-# Direction
-JOINT_OFFSETS_DEG = [0, 0, 0, 0]
-JOINT_SIGNS       = [+1, +1, +1, +1]
+# Control Table Protocol 2.0
+ADDR_OPERATING_MODE   = 11
+ADDR_TORQUE_ENABLE    = 64
+ADDR_GOAL_POSITION    = 116   # 4-byte
+ADDR_PRESENT_POSITION = 132   # 4-byte
+ADDR_PROFILE_ACCEL    = 108   # 4-byte
+ADDR_PROFILE_VELOCITY = 112   # 4-byte
+ADDR_TORQUE_LIMIT     = 102   # 2-byte
 
-# Limitaions
-SOFT_LIMITS_DEG: List[Optional[Tuple[float, float]]] = [
-    (0, 300), (0, 300), (0, 300), (0, 300)
-]
+MODE_POSITION = 3
+MODE_EXTENDED_POSITION = 4
+TORQUE_ENABLE = 1
+TORQUE_DISABLE = 0
+TICKS_MAX = 4095
 
-# Smooth
 PROFILE_ACCEL = 40
 PROFILE_VELOC = 60
+TORQUE_LIMIT_VAL = 1000
 
-# Control Table
-ADDR_TORQUE_ENABLE     = 64
-ADDR_OPERATING_MODE    = 11
-ADDR_GOAL_POSITION     = 116
-ADDR_PRESENT_POSITION  = 132
-ADDR_PROFILE_VELOCITY  = 112
-ADDR_PROFILE_ACCEL     = 108
-ADDR_TORQUE_LIMIT      = 102
+EPOS_REV_MAX = 200
+MIN_TICK_5 = -EPOS_REV_MAX * TICKS_MAX
+MAX_TICK_5 =  EPOS_REV_MAX * TICKS_MAX
+###############################################
+# Utility
+###############################################
 
-TORQUE_ENABLE  = 1
-TORQUE_DISABLE = 0
-MODE_POSITION  = 3
-TICKS_MAX      = 4095
-TORQUE_LIMIT   = 765 # 75% of max torque (max is 1023)  
-
-# Constants
-PI = 3.1415926
-GEAR_RATIO = 30/76      # from little gear to big gear on color switching end effector
-
-# Degree setup
-def _wrap_deg(d: float) -> float:
-    # d = d % 360.0
+def wrap_deg(d):
+    d = d % 360.0
     return d if d >= 0 else d + 360.0
-    # return d
 
-def deg_to_ticks(deg: float) -> int:
-    return int(round(_wrap_deg(deg) / 360.0 * TICKS_MAX)) & TICKS_MAX
+def deg_to_ticks(d):
+    return int(round(wrap_deg(d) / 360 * TICKS_MAX))
 
-def ticks_to_deg(ticks: int) -> float:
-    return ((int(ticks) & TICKS_MAX) / TICKS_MAX) * 360.0
+def ticks_to_deg(t):
+    return (t % TICKS_MAX) / TICKS_MAX * 360.0
+
+
+###############################################
+# Arm Class (Protocol 2.0)
+###############################################
 
 class Arm5DOF:
-    def __init__(self, port_name: str = DEVICENAME, baud: int = BAUDRATE, joint_ids: List[int] = JOINT_IDS):
-        self.joint_ids = joint_ids
+    def __init__(self, port_name=DEVICENAME, baud=BAUDRATE):
+
+        # Open port
         self.port = PortHandler(port_name)
         if not self.port.openPort():
-            raise RuntimeError(f"Cannot open port: {port_name}")
+            raise RuntimeError("Cannot open port")
         if not self.port.setBaudRate(baud):
-            raise RuntimeError(f"Cannot set baudrate: {baud}")
+            raise RuntimeError("Cannot set baudrate")
+
+        # Protocol 2.0
         self.pkt = PacketHandler(2.0)
 
-        for jid in self.joint_ids:
-            model, comm, err = self.pkt.ping(self.port, jid)
-            if comm != COMM_SUCCESS or err != 0:
-                raise RuntimeError(f"Ping ID={jid} failed")
-            self.pkt.write1ByteTxRx(self.port, jid, ADDR_OPERATING_MODE, MODE_POSITION)
-            if PROFILE_ACCEL is not None:
-                self.pkt.write4ByteTxRx(self.port, jid, ADDR_PROFILE_ACCEL, int(PROFILE_ACCEL))
-            if PROFILE_VELOC is not None:
-                self.pkt.write4ByteTxRx(self.port, jid, ADDR_PROFILE_VELOCITY, int(PROFILE_VELOC))
-            self.pkt.write2ByteTxRx(self.port, jid, ADDR_TORQUE_LIMIT, TORQUE_LIMIT)
-            self.pkt.write1ByteTxRx(self.port, jid, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
-            
+        # Configure motors
+        for j, dxid in JOINT_MAP.items():
+            # 先关扭矩再改模式（官方要求）
+            self.pkt.write1ByteTxRx(self.port, dxid, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
 
-    def close(self):
-        for jid in self.joint_ids:
-            self.pkt.write1ByteTxRx(self.port, jid, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
-        self.port.closePort()
+            if j == 5:
+                # 5 号：Extended Position Mode（多圈）
+                self.pkt.write1ByteTxRx(self.port, dxid, ADDR_OPERATING_MODE, MODE_EXTENDED_POSITION)
+            else:
+                # 其他：普通位置模式
+                self.pkt.write1ByteTxRx(self.port, dxid, ADDR_OPERATING_MODE, MODE_POSITION)
 
-    def _map_joint(self, jn: int) -> int:
-        # if not 1 <= jn <= len(self.joint_ids):
-        #     raise ValueError(f"joint number must be 1..{len(self.joint_ids)}")
-        if jn == 5:
-            extra = 1
-        else:
-            extra = 0
-        return self.joint_ids[jn - 1 - extra]
+            # 平滑参数
+            self.pkt.write4ByteTxRx(self.port, dxid, ADDR_PROFILE_ACCEL,  PROFILE_ACCEL)
+            self.pkt.write4ByteTxRx(self.port, dxid, ADDR_PROFILE_VELOCITY, PROFILE_VELOC)
 
-    def _apply_model(self, jn: int, user_deg: float) -> float:
-        if jn == 5:
-            extra = 1
-        else:
-            extra = 0
-        i = jn - 1 - extra
-        return _wrap_deg(JOINT_SIGNS[i] * user_deg + JOINT_OFFSETS_DEG[i])
+            # “力矩限制”（实际上是 Goal Current，数值不用太大）
+            self.pkt.write2ByteTxRx(self.port, dxid, ADDR_TORQUE_LIMIT, TORQUE_LIMIT_VAL)
 
-    def _inverse_model(self, jn: int, servo_deg: float) -> float:
-        i = jn - 1
-        s = JOINT_SIGNS[i]
-        off = JOINT_OFFSETS_DEG[i]
-        val = (servo_deg - off) / (s if s != 0 else 1)
-        return _wrap_deg(val)
+            # 再开扭矩
+            self.pkt.write1ByteTxRx(self.port, dxid, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
 
-    def _apply_limits(self, jn: int, user_deg: float) -> float:
-        if jn == 5:
-            extra = 1
-        else:
-            extra = 0
-        lim = SOFT_LIMITS_DEG[jn - 1 - extra]
-        if lim is None:
-            return user_deg
-        lo, hi = lim
-        d = _wrap_deg(user_deg)
-        if lo is not None and d < lo: d = lo
-        if hi is not None and d > hi: d = hi
-        return d
+    ###############################################
+    # Movement API
+    ###############################################
 
-    def turn(self, jn: int, degree: float, wait: bool=False, tol_deg: float=1.0, timeout: float=3.0):
-        jid = self._map_joint(jn)
-        limited = self._apply_limits(jn, degree)
-        servo_deg = self._apply_model(jn, limited)
-        goal = deg_to_ticks(servo_deg)
-        self.pkt.write4ByteTxRx(self.port, jid, ADDR_GOAL_POSITION, goal)
-        if not wait: return
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            cur_ticks, _, _ = self.pkt.read4ByteTxRx(self.port, jid, ADDR_PRESENT_POSITION)
-            cur_deg = ticks_to_deg(cur_ticks)
-            err = min((cur_deg - servo_deg) % 360, (servo_deg - cur_deg) % 360)
-            if err <= tol_deg: return
-            time.sleep(0.01)
+    def move(self, joint: int, deg: float, wait=False):
+        if joint not in JOINT_MAP:
+            raise ValueError("Invalid joint")
 
-    def turns(self, targets: Iterable[float] | Dict[int, float], wait: bool=False, tol_deg: float=1.0, timeout: float=3.0):
-        user_cmd = [None]*len(self.joint_ids)  # type: ignore
-        if isinstance(targets, dict):
-            for k,v in targets.items():
-                if not 1 <= k <= len(self.joint_ids): raise ValueError("joint index out of range")
-                user_cmd[k-1] = v
-        else:
-            seq = list(targets)
-            if len(seq) != len(self.joint_ids): raise ValueError(f"list must have {len(self.joint_ids)} angles")
-            user_cmd = seq
+        # direction + offset
+        deg = JOINT_SIGNS[joint] * deg + JOINT_OFFSET[joint]
 
-        gsw = GroupSyncWrite(self.port, self.pkt, ADDR_GOAL_POSITION, 4)
-        set_idx = []
-        for jn, maybe_deg in enumerate(user_cmd, start=1):
-            if maybe_deg is None: continue
-            set_idx.append(jn)
-            jid = self._map_joint(jn)
-            servo_deg = self._apply_model(jn, self._apply_limits(jn, maybe_deg))
-            pos = deg_to_ticks(servo_deg)
-            param = [pos & 0xFF, (pos>>8)&0xFF, (pos>>16)&0xFF, (pos>>24)&0xFF]
-            if not gsw.addParam(jid, bytes(param)):
-                raise RuntimeError(f"GSW addParam failed for joint {jn} (ID={jid})")
-        if gsw.txPacket() != COMM_SUCCESS: raise RuntimeError("GroupSyncWrite txPacket failed")
-        gsw.clearParam()
+        lo, hi = LIMITS[joint]
 
-        if not wait or not set_idx: return
-        ids_wait  = [self._map_joint(i) for i in set_idx]
-        targets_d = [self._apply_model(i, self._apply_limits(i, user_cmd[i-1])) for i in set_idx]  # type: ignore
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            ok = True
-            for jid, tg in zip(ids_wait, targets_d):
-                now_ticks, _, _ = self.pkt.read4ByteTxRx(self.port, jid, ADDR_PRESENT_POSITION)
-                now_deg = ticks_to_deg(now_ticks)
-                err = min((now_deg - tg) % 360, (tg - now_deg) % 360)
-                if err > tol_deg: ok = False; break
-            if ok: return
-            time.sleep(0.01)
+        # Apply lower limit if defined
+        if lo is not None:
+            deg = max(deg, lo)
 
-    def get(self, jn: int) -> float:
-        jid = self._map_joint(jn)
-        ticks, _, _ = self.pkt.read4ByteTxRx(self.port, jid, ADDR_PRESENT_POSITION)
+        # Apply upper limit if defined
+        if hi is not None:
+            deg = min(deg, hi)
+
+        # convert to ticks
+        pos = deg_to_ticks(deg)
+        dxid = JOINT_MAP[joint]
+
+        # WRITE 4-BYTE GOAL POSITION
+        self.pkt.write4ByteTxRx(self.port, dxid, ADDR_GOAL_POSITION, pos)
+
+        if wait:
+            self._wait_joint(dxid, deg)
+
+    def move_all(self, commands: Dict[int, float], wait=False):
+        """ dict: {joint → degree} """
+        for j, d in commands.items():
+            self.move(j, d, wait=False)
+
+        if wait:
+            for j, d in commands.items():
+                dxid = JOINT_MAP[j]
+                target = wrap_deg(JOINT_SIGNS[j] * d + JOINT_OFFSET[j])
+                self._wait_joint(dxid, target)
+
+    ###############################################
+    # Sensor API
+    ###############################################
+
+    def read(self, joint):
+        dxid = JOINT_MAP[joint]
+        ticks,_,_ = self.pkt.read4ByteTxRx(self.port, dxid, ADDR_PRESENT_POSITION)
         return ticks_to_deg(ticks)
 
-    def seq_same_delta_hold_then_return(self, delta_deg: float, dwell: float=0.5, settle: bool=True):
-        user0 = []
-        for jn in range(1, len(self.joint_ids)+1):
-            servo_deg = self.get(jn)
-            user0.append(self._inverse_model(jn, servo_deg))
+    ###############################################
+    # Wait function for smooth motion
+    ###############################################
 
-        for jn in range(1, len(self.joint_ids)+1):
-            self.turn(jn, user0[jn-1] + delta_deg, wait=settle)
-            time.sleep(dwell)
+    def _wait_joint(self, dxid, target_deg, tol=1.5):
+        t0 = time.time()
+        while time.time() - t0 < 3:
+            ticks,_,_ = self.pkt.read4ByteTxRx(self.port, dxid, ADDR_PRESENT_POSITION)
+            now = ticks_to_deg(ticks)
+            if abs((now - target_deg) % 360) < tol:
+                return
+            time.sleep(0.01)
 
-        self.turns(user0, wait=True)
+    ###############################################
+    # Special joint functions
+    ###############################################
 
-    def start1(self):
-        user0 = []
-        for jn in range(1, len(self.joint_ids)+1):
-            servo_deg = self.get(jn)
-            user0.append(self._inverse_model(jn, servo_deg))
+    def prismatic(self, mm):
+        deg = mm * 2  # TODO replace with real conversion
+        self.move(1, deg, wait=True)
 
-    def read_angle(self):
-       ticks, comm, err = self.pkt.read4ByteTxRx(PortHandler("COM5"), 3, 132)
-       angle = ticks / 4095 * 360
-       print(angle)
+    def color_next(self):
+        self.move(5, 180, wait=True)
 
+    ###############################################
+    # Close the port
+    ###############################################
 
-    def go_prismatic(self):
-        """
-        vertical_amt: the length (in mm) you want to move the prismatic joint
-        direction: +1 = up
-                   -1 = down
-        """
-        # diameter = 30 #mm
-        # vert_deg = direction*360*(vertical_amt/(PI*diameter))
-        # self.turn(jn = 1, degree = vert_deg)
-        self.turn(jn = 1, degree = 100)
-        time.sleep(0.5)
+    def close(self):
+        for dxid in JOINT_MAP.values():
+            self.pkt.write1ByteTxRx(self.port, dxid, ADDR_TORQUE_ENABLE, 0)
+        self.port.closePort()
 
-
-    def go_to(self):
-        """
-        TODO: implement this function
-        this function should move motors 2/3 to move end effector to target position
-        (put inverse kinematics here)
-        """
-
-    def go_to_start(self):
-        self.turn(jn = 2, degree = 30)
-        self.turn(jn = 3, degree = 30)
-
-
-    def scribble(self):
-        for i in range(5):
-            self.turn(jn = 2, degree = -20)
-            self.turn(jn = 3, degree = 200)
-            time.sleep(0.5)
-            self.turn(jn = 2, degree = 20)
-            self.turn(jn = 3, degree = -210)
-            time.sleep(0.5)
-
-
-
-    def color_rotate(self):
-        """ Move motor 5 to rotate end effector. (One color at a time)"""
-
-        self.turn(jn = 5, degree = 180)
-        time.sleep(0.5)
-        # self.turn(jn = 5, degree = 400)
-        # time.sleep(0.5)
-        # self.turn(jn = 5, degree = 120)
-        # self.turn(jn = 5, degree = -10)
-
-
-    def draw_gradient(self):
-        up_down_amt = 40
-
-        self.start1()
-
-        # self.go_to_start()
-        # self.go_prismatic()
-        self.scribble()
-        # self.color_rotate()
-
-        # self.go_prismatic(up_down_amt, -1)
-        # self.color_rotate()
-        # self.move_a_litte()
-        # self.go_prismatic(up_down_amt, 1)
-        # self.scribble()
-
-        # self.go_prismatic(up_down_amt, -1)
-        # self.color_rotate()
-        # self.move_a_litte()
-        # self.go_prismatic(up_down_amt, 1)
-        # self.scribble()
-
-        # self.go_prismatic(up_down_amt, -1)
-        # self.color_rotate()
-        # self.move_a_litte()
-        # self.go_prismatic(up_down_amt, 1)
-        # self.scribble()
-
-        # self.go_prismatic(up_down_amt, 1)
-
+    def angle_converter(self, joint: int, angle):
+        if (joint == 2):
+            angle -= 17
+            return angle
+        if (joint == 3):
+            angle -=35
+            return angle
         
+    def turn_relative(self, joint: int, delta_deg: float, wait: bool = True):
+        dxid = JOINT_MAP[joint]
+
+        if joint in (1, 5):
+            # 1 & 5：在 tick 空间做真正的相对多圈运动
+            cur_ticks, comm_r, err_r = self.pkt.read4ByteTxRx(
+                self.port, dxid, ADDR_PRESENT_POSITION
+            )
+            # print(f"[turn_relative] joint {joint} read cur_ticks={cur_ticks}, comm={comm_r}, err={err_r}")
+
+            delta_ticks = int(delta_deg / 360.0 * TICKS_MAX)
+            target_ticks = cur_ticks + delta_ticks
+
+            # 针对 5 号：限制在 Extended Position 合法范围内
+            if joint == 5:
+                if target_ticks < MIN_TICK_5:
+                    target_ticks = MIN_TICK_5
+                if target_ticks > MAX_TICK_5:
+                    target_ticks = MAX_TICK_5
+
+            comm_w, err_w = self.pkt.write4ByteTxRx(
+                self.port, dxid, ADDR_GOAL_POSITION, int(target_ticks)
+            )
+            # print(f"[turn_relative] joint {joint} write comm={comm_w}, err={err_w}, delta_ticks={delta_ticks}")
+
+            if not wait:
+                return
+
+            t0 = time.time()
+            while time.time() - t0 < 5:
+                now_ticks, _, _ = self.pkt.read4ByteTxRx(self.port, dxid, ADDR_PRESENT_POSITION)
+                if abs(now_ticks - target_ticks) < 10:
+                    return
+                time.sleep(0.05)
+
+        else:
+            # 2、3 继续用角度相对控制（单圈）
+            current_deg = self.read(joint)
+            target_deg = current_deg + delta_deg
+            self.move(joint, target_deg, wait=wait)
+
+
+
+    def hl(self, mode):
+        if mode == 1: # to the highest point
+            self.move(1, 111, wait=True)
+        if mode == 0: # to the lowest point
+            self.move(1, 160, wait=True)
+    
+    def home(self):
+        self.hl(1)
+        self.move(2, self.angle_converter(2, 180), wait=True)
+        self.move(3, self.angle_converter(3, 180), wait=True)
+
+    def switch_pen(self):
+        self.turn_relative(5, 135, wait=True) 
+
+
+    # Geometry Setting'
+    L2 = 5.5
+    L3 = 5.5
+    SERVO2_MIN = 100
+    SERVO2_MAX = 220
+    SERVO3_MIN = 90
+    SERVO3_MAX = 220
+
+    def ik_xy(self, x: float, y: float) -> tuple[float, float]:
+        """
+        给定平面坐标 (x, y) [inch]，求“舵机角” (servo2, servo3)，单位 deg。
+
+        步骤：
+        1) 用 2-link 几何算两支解 (geom2, geom3)
+        2) 在“几何角限制” [GEOM*_MIN, GEOM*_MAX] 里检查合法性
+        3) 对合法的解，用 geom_to_servo 转成舵机角，并挑一个最中间的解返回
+        """
+        L2, L3 = self.L2, self.L3
+
+        r2 = x * x + y * y
+        cos_t3 = (r2 - L2 * L2 - L3 * L3) / (2 * L2 * L3)
+        #cos_t3 = max(-1.0, min(1.0, cos_t3))  # 数值保护
+
+        candidates = []
+
+        for sign in (+1.0, -1.0):  # elbow-down / elbow-up
+            t3 = sign * math.acos(cos_t3)
+            t2 = math.atan2(y, x) - math.atan2(
+                L3 * math.sin(t3),
+                L2 + L3 * math.cos(t3)
+            )
+
+            geom2 = math.degrees(t2)
+            geom3 = math.degrees(t3)
+            print(geom2)
+            print(geom3)
+            # 在几何角空间里检查 joint limit
+            ok2 = (self.GEOM2_MIN <= geom2 <= self.GEOM2_MAX)
+            ok3 = (self.GEOM3_MIN <= geom3 <= self.GEOM3_MAX)
+
+            if ok2 and ok3:
+                # 合法解：转换为舵机角，存起来
+                servo2 = self.geom_to_servo(2, geom2)
+                servo3 = self.geom_to_servo(3, geom3)
+                candidates.append((servo2, servo3))
+
+        if not candidates:
+            # 这才是真的：在当前关节限制里，这个 (x,y) 确实不可达
+            raise ValueError(f"IK: point (x={x:.2f}, y={y:.2f}) unreachable in joint limits")
+
+        # 有多组合法解：选一个离舵机角中间位置最近的（让姿态“居中”一点）
+        mid2 = 0.5 * (self.SERVO2_MIN + self.SERVO2_MAX)
+        mid3 = 0.5 * (self.SERVO3_MIN + self.SERVO3_MAX)
+
+        def cost(sol):
+            s2, s3 = sol
+            return (s2 - mid2) ** 2 + (s3 - mid3) ** 2
+
+        best = min(candidates, key=cost)
+        return best  # (servo2, servo3)
 
     
+    def move_xy(self, x: float, y: float, wait: bool = True):
+        """
+        用 IK 把末端移动到纸上 (x,y) [inch]。
+        这里得到的是舵机角度，直接丢给 self.move(2/3, angle)。
+        """
+        servo2_deg, servo3_deg = self.ik_xy(x, y)
+        self.move(2, servo2_deg, wait=False)
+        self.move(3, servo3_deg, wait=wait)
+
+    def draw_line_xy(self, x1: float, y1: float,
+                           x2: float, y2: float,
+                           steps: int = 40):
+        """
+        在平面上从 (x1,y1) 连续画到 (x2,y2)，不抬笔。
+        默认认为一开始已经在 (x1,y1)，否则会先插值过去。
+        """
+        # 先确保到达起点（如果之前不在）
+        self.move_xy(x1, y1, wait=True)
+
+        # 从起点插值到终点
+        for k in range(1, steps + 1):
+            u = k / steps
+            x = x1 * (1 - u) + x2 * u
+            y = y1 * (1 - u) + y2 * u
+            last = (k == steps)
+            self.move_xy(x, y, wait=last)
+
+    def draw_rectangle_4colors_2d(self,
+                                  x0: float, y0: float,
+                                  w: float, h: float,
+                                  steps_per_edge: int = 40):
+        """
+        在 2D 平面上画一个矩形：
+        - 左下角在 (x0, y0) [inch]
+        - 宽 w、高 h [inch]
+        - 四条边依次使用四种颜色（通过 5 号关节切换）
+        默认“笔一直接触纸面”，没有抬笔逻辑。
+        """
+
+        # 四个角（逆时针）
+        p1 = (x0,       y0      )  # 左下
+        p2 = (x0 + w,   y0      )  # 右下
+        p3 = (x0 + w,   y0 + h  )  # 右上
+        p4 = (x0,       y0 + h  )  # 左上
+
+        edges = [
+            (p1, p2),  # 底边：颜色1
+            (p2, p3),  # 右边：颜色2
+            (p3, p4),  # 顶边：颜色3
+            (p4, p1),  # 左边：颜色4
+        ]
+
+        # 先移动到起点
+        self.move_xy(*p1, wait=True)
+
+        for i, (start, end) in enumerate(edges):
+            if i > 0:
+                # 第二条边开始，每条边换一次颜色
+                self.switch_pen()
+
+            x1, y1 = start
+            x2, y2 = end
+            self.draw_line_xy(x1, y1, x2, y2, steps=steps_per_edge)
+
+
+    def servo_to_geom(self, joint: int, servo_deg: float) -> float:
+        """
+        舵机角 -> DH/几何角
+        你之前的 angle_converter 是:
+            servo = geom - offset
+        所以这里反过来:
+            geom = servo + offset
+        """
+        if joint == 2:
+            return servo_deg + 17.0   # 和你 angle_converter 的 17 对应
+        if joint == 3:
+            return servo_deg + 35.0   # 和你 angle_converter 的 35 对应
+        return servo_deg
+
+    def geom_to_servo(self, joint: int, geom_deg: float) -> float:
+        """
+        几何角 -> 舵机角
+        对应你之前的 angle_converter 逻辑:
+            servo = geom - offset
+        """
+        if joint == 2:
+            return geom_deg - 17.0
+        if joint == 3:
+            return geom_deg - 35.0
+        return geom_deg
+
+    @property
+    def GEOM2_MIN(self):
+        return self.servo_to_geom(2, self.SERVO2_MIN)
+
+    @property
+    def GEOM2_MAX(self):
+        return self.servo_to_geom(2, self.SERVO2_MAX)
+
+    @property
+    def GEOM3_MIN(self):
+        return self.servo_to_geom(3, self.SERVO3_MIN)
+
+    @property
+    def GEOM3_MAX(self):
+        return self.servo_to_geom(3, self.SERVO3_MAX)
+
+    # ====== 2) 正向运动学：给关节角 -> 算 (x,y) ======
+    def fk_xy_from_servo(self, j2_servo: float, j3_servo: float) -> tuple[float, float]:
+        """
+        输入: joint2, joint3 的舵机角（deg, 在 [JOINT*_MIN, JOINT*_MAX] 里）
+        输出: 末端在平面内的 (x,y) 位置 [inch]
+        """
+        # 舵机角 -> 几何角
+        th2_geom = math.radians(self.servo_to_geom(2, j2_servo))
+        th3_geom = math.radians(self.servo_to_geom(3, j3_servo))
+
+        x = self.L2 * math.cos(th2_geom) + self.L3 * math.cos(th2_geom + th3_geom)
+        y = self.L2 * math.sin(th2_geom) + self.L3 * math.sin(th2_geom + th3_geom)
+        return x, y
+    
+    def scribble(self, joint: int, joint1, times, st, end):
+        for i in range(times):
+            self.move(joint, self.angle_converter(joint, st), wait=True)
+            self.move(joint1,self.angle_converter(joint1, st), wait=True)
+            self.move(joint, self.angle_converter(joint, end), wait=True)
+            self.move(joint1,self.angle_converter(joint, end), wait=False)
+###############################################
+# RUN TEST
+###############################################
+
 if __name__ == "__main__":
     arm = Arm5DOF()
-    try:
-        # arm.seq_same_delta_hold_then_return(delta_deg=30, dwell=0.6, settle=True)
-        arm.draw_gradient()
-        # arm.read_angle()
+    #arm.move(5, 145, wait=True)
+    #arm.move(2,163, wait=True)
+    # arm.home()
 
-    finally:
-        arm.close()
-
-
-   
+    # arm.draw_rectangle_4colors_2d(
+    # x0 = 8.0,   # TODO: 根据你的纸的位置调
+    # y0 = 2.0,   # TODO: 根据你的纸的位置调
+    # w  = 4.0,   # TODO: 矩形宽度
+    # h  = 3.0,   # TODO: 矩形高度
+    # steps_per_edge = 50
+    # )
+    #arm.move(1,60,wait=True)
+    #arm.switch_pen()
+    #arm.hl(1)
+    #arm.hl(1)
+    #arm.home(
+    
+    arm.home()
+    arm.hl(0)
+    arm.scribble(2,3,3, 130, 220)
+    arm.home()
+    arm.switch_pen()
+    arm.hl(0)
+    arm.scribble(2,3,3,150, 210)
+    arm.home()
+    #arm.close()

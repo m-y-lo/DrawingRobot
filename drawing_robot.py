@@ -92,24 +92,16 @@ class Arm5DOF:
 
         # Configure motors
         for j, dxid in JOINT_MAP.items():
-            # 先关扭矩再改模式（官方要求）
             self.pkt.write1ByteTxRx(self.port, dxid, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
 
             if j == 5:
-                # 5 号：Extended Position Mode（多圈）
                 self.pkt.write1ByteTxRx(self.port, dxid, ADDR_OPERATING_MODE, MODE_EXTENDED_POSITION)
             else:
-                # 其他：普通位置模式
                 self.pkt.write1ByteTxRx(self.port, dxid, ADDR_OPERATING_MODE, MODE_POSITION)
-
-            # 平滑参数
             self.pkt.write4ByteTxRx(self.port, dxid, ADDR_PROFILE_ACCEL,  PROFILE_ACCEL)
             self.pkt.write4ByteTxRx(self.port, dxid, ADDR_PROFILE_VELOCITY, PROFILE_VELOC)
 
-            # “力矩限制”（实际上是 Goal Current，数值不用太大）
             self.pkt.write2ByteTxRx(self.port, dxid, ADDR_TORQUE_LIMIT, TORQUE_LIMIT_VAL)
-
-            # 再开扭矩
             self.pkt.write1ByteTxRx(self.port, dxid, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
 
     ###############################################
@@ -217,7 +209,7 @@ class Arm5DOF:
             delta_ticks = int(delta_deg / 360.0 * TICKS_MAX)
             target_ticks = cur_ticks + delta_ticks
 
-            # 针对 5 号：限制在 Extended Position 合法范围内
+        
             if joint == 5:
                 if target_ticks < MIN_TICK_5:
                     target_ticks = MIN_TICK_5
@@ -271,14 +263,6 @@ class Arm5DOF:
     SERVO3_MAX = 220
 
     def ik_xy(self, x: float, y: float) -> tuple[float, float]:
-        """
-        给定平面坐标 (x, y) [inch]，求“舵机角” (servo2, servo3)，单位 deg。
-
-        步骤：
-        1) 用 2-link 几何算两支解 (geom2, geom3)
-        2) 在“几何角限制” [GEOM*_MIN, GEOM*_MAX] 里检查合法性
-        3) 对合法的解，用 geom_to_servo 转成舵机角，并挑一个最中间的解返回
-        """
         L2, L3 = self.L2, self.L3
 
         r2 = x * x + y * y
@@ -298,7 +282,6 @@ class Arm5DOF:
             geom3 = math.degrees(t3)
             print(geom2)
             print(geom3)
-            # 在几何角空间里检查 joint limit
             ok2 = (self.GEOM2_MIN <= geom2 <= self.GEOM2_MAX)
             ok3 = (self.GEOM3_MIN <= geom3 <= self.GEOM3_MAX)
 
@@ -309,10 +292,8 @@ class Arm5DOF:
                 candidates.append((servo2, servo3))
 
         if not candidates:
-            # 这才是真的：在当前关节限制里，这个 (x,y) 确实不可达
             raise ValueError(f"IK: point (x={x:.2f}, y={y:.2f}) unreachable in joint limits")
 
-        # 有多组合法解：选一个离舵机角中间位置最近的（让姿态“居中”一点）
         mid2 = 0.5 * (self.SERVO2_MIN + self.SERVO2_MAX)
         mid3 = 0.5 * (self.SERVO3_MIN + self.SERVO3_MAX)
 
@@ -336,14 +317,8 @@ class Arm5DOF:
     def draw_line_xy(self, x1: float, y1: float,
                            x2: float, y2: float,
                            steps: int = 40):
-        """
-        在平面上从 (x1,y1) 连续画到 (x2,y2)，不抬笔。
-        默认认为一开始已经在 (x1,y1)，否则会先插值过去。
-        """
-        # 先确保到达起点（如果之前不在）
-        self.move_xy(x1, y1, wait=True)
 
-        # 从起点插值到终点
+        self.move_xy(x1, y1, wait=True)
         for k in range(1, steps + 1):
             u = k / steps
             x = x1 * (1 - u) + x2 * u
@@ -355,33 +330,24 @@ class Arm5DOF:
                                   x0: float, y0: float,
                                   w: float, h: float,
                                   steps_per_edge: int = 40):
-        """
-        在 2D 平面上画一个矩形：
-        - 左下角在 (x0, y0) [inch]
-        - 宽 w、高 h [inch]
-        - 四条边依次使用四种颜色（通过 5 号关节切换）
-        默认“笔一直接触纸面”，没有抬笔逻辑。
-        """
 
-        # 四个角（逆时针）
-        p1 = (x0,       y0      )  # 左下
-        p2 = (x0 + w,   y0      )  # 右下
-        p3 = (x0 + w,   y0 + h  )  # 右上
-        p4 = (x0,       y0 + h  )  # 左上
+        p1 = (x0,       y0      )  
+        p2 = (x0 + w,   y0      )  
+        p3 = (x0 + w,   y0 + h  )  
+        p4 = (x0,       y0 + h  )  
 
         edges = [
-            (p1, p2),  # 底边：颜色1
-            (p2, p3),  # 右边：颜色2
-            (p3, p4),  # 顶边：颜色3
-            (p4, p1),  # 左边：颜色4
+            (p1, p2),  
+            (p2, p3),  
+            (p3, p4), # 
+            (p4, p1), 
         ]
 
-        # 先移动到起点
         self.move_xy(*p1, wait=True)
 
         for i, (start, end) in enumerate(edges):
             if i > 0:
-                # 第二条边开始，每条边换一次颜色
+               
                 self.switch_pen()
 
             x1, y1 = start
@@ -390,25 +356,15 @@ class Arm5DOF:
 
 
     def servo_to_geom(self, joint: int, servo_deg: float) -> float:
-        """
-        舵机角 -> DH/几何角
-        你之前的 angle_converter 是:
-            servo = geom - offset
-        所以这里反过来:
-            geom = servo + offset
-        """
+   
         if joint == 2:
-            return servo_deg + 17.0   # 和你 angle_converter 的 17 对应
+            return servo_deg + 17.0 
         if joint == 3:
-            return servo_deg + 35.0   # 和你 angle_converter 的 35 对应
+            return servo_deg + 35.0  
         return servo_deg
 
     def geom_to_servo(self, joint: int, geom_deg: float) -> float:
-        """
-        几何角 -> 舵机角
-        对应你之前的 angle_converter 逻辑:
-            servo = geom - offset
-        """
+
         if joint == 2:
             return geom_deg - 17.0
         if joint == 3:
@@ -431,13 +387,9 @@ class Arm5DOF:
     def GEOM3_MAX(self):
         return self.servo_to_geom(3, self.SERVO3_MAX)
 
-    # ====== 2) 正向运动学：给关节角 -> 算 (x,y) ======
+  
     def fk_xy_from_servo(self, j2_servo: float, j3_servo: float) -> tuple[float, float]:
-        """
-        输入: joint2, joint3 的舵机角（deg, 在 [JOINT*_MIN, JOINT*_MAX] 里）
-        输出: 末端在平面内的 (x,y) 位置 [inch]
-        """
-        # 舵机角 -> 几何角
+        
         th2_geom = math.radians(self.servo_to_geom(2, j2_servo))
         th3_geom = math.radians(self.servo_to_geom(3, j3_servo))
 
@@ -462,10 +414,10 @@ if __name__ == "__main__":
     # arm.home()
 
     # arm.draw_rectangle_4colors_2d(
-    # x0 = 8.0,   # TODO: 根据你的纸的位置调
-    # y0 = 2.0,   # TODO: 根据你的纸的位置调
-    # w  = 4.0,   # TODO: 矩形宽度
-    # h  = 3.0,   # TODO: 矩形高度
+    # x0 = 8.0,   
+    # y0 = 2.0,   
+    # w  = 4.0,   
+    # h  = 3.0,  
     # steps_per_edge = 50
     # )
     #arm.move(1,60,wait=True)
